@@ -94,7 +94,7 @@ async def ws_tts(ws: WebSocket):
 
         # 2) Anslut till ElevenLabs
         # Behåll mp3_44100_64 för kompatibilitet med fallback i frontend
-        query = f"?model_id={model_id}&output_format=mp3_44100_64&auto_mode=true"
+        query = f"?model_id={model_id}&output_format=pcm_16000"
         eleven_ws_url = f"wss://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream-input{query}"
         headers = [("xi-api-key", settings.ELEVENLABS_API_KEY)]
 
