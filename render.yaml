@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: stefan-api-test-3
+    env: docker
+    plan: starter
+    autoDeploy: true
+    envVars:
+      - key: ELEVENLABS_API_KEY
+        sync: false
+      - key: DEFAULT_VOICE_ID
+        sync: false
+      - key: DEFAULT_MODEL_ID
+        value: eleven_turbo_v2_5
+      - key: ALLOWED_ORIGIN_REGEX
+        value: ^https?://(localhost(:\d+)?|.*\.lovable\.app)$
+      - key: MAX_TEXT_CHARS
+        value: "1000"
+      - key: LOG_LEVEL
+        value: info
