@@ -14,7 +14,7 @@ from .config import settings
 logger = logging.getLogger("stefan-api-test-3")
 logging.basicConfig(level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO))
 
-app = FastAPI(title="stefan-api-test-3", version="0.1.1")
+app = FastAPI(title="stefan-api-test-3", version="0.1.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -87,24 +87,24 @@ async def ws_tts(ws: WebSocket):
             ).decode()
         )
 
-        # WS-URL till ElevenLabs (behåll MP3 så frontend kan spela upp blobben)
-        query = f"?model_id={model_id}&output_format=mp3_44100_64"
+        # Behåll samma parametrar som när det fungerade: auto_mode + mp3 för låg latens och fallback-kompatibilitet
+        query = f"?model_id={model_id}&output_format=mp3_44100_64&auto_mode=true"
         eleven_ws_url = (
             f"wss://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream-input{query}"
         )
         headers = [("xi-api-key", settings.ELEVENLABS_API_KEY)]
 
         async with ws_connect(eleven_ws_url, extra_headers=headers, open_timeout=30) as eleven:
-            # Initiera sessionen med röst- och generation-settings
+            # Initiera session (kickstart)
             init_msg = {
-                "text": " ",  # kickstart
+                "text": " ",  # liten kickstart enligt tidigare fungerande flöde
                 "voice_settings": {
                     "stability": 0.5,
                     "similarity_boost": 0.8,
                     "use_speaker_boost": False,
                     "speed": 1.0,
                 },
-                # Lägre chunk-trösklar → snabbare första audio
+                # valfritt: låga chunk-trösklar för snabbare start; stör inte try_trigger_generation
                 "generation_config": {
                     "chunk_length_schedule": [50, 90, 140]
                 },
@@ -112,21 +112,21 @@ async def ws_tts(ws: WebSocket):
             }
             await eleven.send(orjson.dumps(init_msg).decode())
 
-            # Skicka användarens text
-            await eleven.send(orjson.dumps({"text": text}).decode())
+            # Skicka användarens text och be Eleven att trigga generering direkt
+            await eleven.send(orjson.dumps({"text": text, "try_trigger_generation": True}).decode())
 
-            # Tvinga flush i slutet så korta texter alltid genereras
-            await eleven.send(orjson.dumps({"text": "", "flush": True}).decode())
+            # Avsluta inmatning: tom sträng signalerar slut → förhindrar 20s-timeout
+            await eleven.send(orjson.dumps({"text": ""}).decode())
 
             await ws.send_text(orjson.dumps({"type": "status", "stage": "streaming"}).decode())
 
-            # Vidarebefordra inkommande chunkar
+            # Läs och vidarebefordra chunkar
             async for server_msg in eleven:
-                # ElevenLabs skickar normalt JSON-frames
+                # Vanligen JSON med ev. "audio" fält (base64)
                 try:
                     payload = json.loads(server_msg)
                 except Exception:
-                    # Om det mot förmodan kommer binärt → skicka vidare
+                    # Om det mot förmodan kommer binärt → skicka vidare direkt
                     if isinstance(server_msg, (bytes, bytearray)):
                         await ws.send_bytes(server_msg)
                     continue
@@ -151,7 +151,7 @@ async def ws_tts(ws: WebSocket):
                     except Exception as e:
                         logger.warning("Kunde inte dekoda audio-chunk: %s", e)
 
-                # Slutsignal
+                # Slutflagga från Eleven
                 if payload.get("isFinal") is True or payload.get("event") == "finalOutput":
                     break
 
