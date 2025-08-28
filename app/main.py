@@ -2,14 +2,12 @@ import asyncio
 import base64
 import json
 import logging
-import os
 from typing import Optional
 
 import orjson
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Body, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-import websockets
 from websockets.client import connect as ws_connect
 
 from .config import settings
@@ -28,20 +26,27 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 class EchoIn(BaseModel):
     text: str = Field(..., max_length=1000)
+
 
 @app.get("/healthz")
 async def healthz():
     return {"ok": True, "service": "stefan-api-test-3"}
+
 
 @app.post("/echo")
 async def echo(payload: EchoIn):
     length = len(payload.text or "")
     logger.info("Echo text received: %s chars", length)
     if length > settings.MAX_TEXT_CHARS:
-        raise HTTPException(status_code=400, detail=f"Texten är för lång (>{settings.MAX_TEXT_CHARS}).")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Texten är för lång (>{settings.MAX_TEXT_CHARS}).",
+        )
     return {"received_chars": length}
+
 
 @app.websocket("/ws/tts")
 async def ws_tts(ws: WebSocket):
@@ -68,58 +73,83 @@ async def ws_tts(ws: WebSocket):
             return
 
         if len(text) > settings.MAX_TEXT_CHARS:
-            await ws.send_text(json.dumps({"type": "error", "message": f"Max {settings.MAX_TEXT_CHARS} tecken"}))
+            await ws.send_text(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "message": f"Max {settings.MAX_TEXT_CHARS} tecken",
+                    }
+                )
+            )
             await ws.close(code=1009)  # too big
             return
 
-        await ws.send_text(orjson.dumps({"type": "status", "stage": "connecting-elevenlabs", "voice_id": voice_id}).decode())
+        await ws.send_text(
+            orjson.dumps(
+                {
+                    "type": "status",
+                    "stage": "connecting-elevenlabs",
+                    "voice_id": voice_id,
+                }
+            ).decode()
+        )
 
-        # Bygg ElevenLabs WS-URL med låg latens
-        # output_format kan vara t.ex. mp3_44100_64 eller pcm_16000 (se docs)
+        # ElevenLabs WS-URL
         query = (
             f"?model_id={model_id}"
             f"&output_format=mp3_44100_64"
             f"&auto_mode=true"
         )
-        eleven_ws_url = f"wss://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream-input{query}"
+        eleven_ws_url = (
+            f"wss://api.elevenlabs.io/v1/text-to-speech/{voice_id}/stream-input{query}"
+        )
         headers = [("xi-api-key", settings.ELEVENLABS_API_KEY)]
 
         async with ws_connect(eleven_ws_url, extra_headers=headers, open_timeout=30) as eleven:
-            # Initiera session (se docs)
+            # Initiera session
             init_msg = {
-                "text": " ",  # kickstart
+                "text": " ",
                 "voice_settings": {
                     "stability": 0.5,
                     "similarity_boost": 0.8,
                     "speed": 1.0,
                 },
-                # vissa klienter skickar även xi_api_key här; header räcker, men vi dubblar för kompatibilitet
                 "xi_api_key": settings.ELEVENLABS_API_KEY,
             }
             await eleven.send(orjson.dumps(init_msg).decode())
 
-            # Skicka användarens text och trigga generering
+            # Skicka användarens text
             await eleven.send(orjson.dumps({"text": text, "try_trigger_generation": True}).decode())
-            # Tom text signalerar slut
             await eleven.send(orjson.dumps({"text": ""}).decode())
 
-            await ws.send_text(orjson.dumps({"type": "status", "stage": "streaming"}).decode())
+            await ws.send_text(
+                orjson.dumps({"type": "status", "stage": "streaming"}).decode()
+            )
 
-            # Vidarebefordra inkommande audio-chunkar som binära meddelanden
             async for raw in eleven:
-                # ElevenLabs skickar JSON med base64-kodad audio
                 try:
                     payload = json.loads(raw)
                 except Exception:
-                    # Om Eleven någon gång skickar binärt (ska inte hända), vidarebefordra direkt
                     if isinstance(raw, (bytes, bytearray)):
                         await ws.send_bytes(raw)
                     continue
 
-                if "audio" in payload:
-                    b = base64.b64decode(payload["audio"])
-                    # skicka som binär WS-frame till frontend
-                    await ws.send_bytes(b)
+                # Fel från Eleven
+                if payload.get("event") == "error" or "error" in payload:
+                    err_msg = payload.get("message") or payload.get("error") or "Okänt fel från TTS-leverantören"
+                    await ws.send_text(
+                        orjson.dumps({"type": "error", "message": err_msg}).decode()
+                    )
+                    break
+
+                # Audio kan vara null eller tomt → hoppa över
+                audio_b64 = payload.get("audio")
+                if isinstance(audio_b64, str) and audio_b64:
+                    try:
+                        b = base64.b64decode(audio_b64)
+                        await ws.send_bytes(b)
+                    except Exception as e:
+                        logger.warning("Kunde inte dekoda audio-chunk: %s", e)
 
                 if payload.get("isFinal") is True or payload.get("event") == "finalOutput":
                     break
